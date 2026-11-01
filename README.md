@@ -1,253 +1,244 @@
 # ComfyUI-WinFix
 
-Windows 上 ComfyUI 长时间运行后变慢、打不开，或手机快速浏览资产后静态页面只剩 `200` 却没有 body 的修复补丁。
+> 修复Comfy UI长时间空置运行后无法访问。  
+> 修复局域网设备（如手机）访问Comfy UI并在资产页快速下滑后导致任何设备将无法访问Comfy UI。
 
-本仓库只有一个文件：
+## 安装
 
-```text
-sitecustomize.py
-```
-
-Python 会从 `site-packages` 自动加载它，不需要修改 ComfyUI 源码。
-
-> 这是针对 Windows `asyncio` Proactor / aiohttp 的兜底方案，不是上游根因修复。替换任何文件前请先备份。
-
----
+- Comfy Desktop端：将文件`sitecustomize.py`放入`(comfy实例)\ComfyUI\.venv\Lib\site-packages`文件夹。
+- ComfyUI便携版：将文件`sitecustomize.py`放入`ComfyUI_windows_portable\python_embeded\Lib\site-packages`文件夹。
 
 ## 现象
 
-- ComfyUI 刚启动时网页秒开；
-- 运行大约两小时后，网页开始越来越慢，最后要几十秒甚至打不开；
-- Ctrl+C、后台回调也会变慢；
-- 手机极短时间内连续预览资产后，可能出现：
+如果你遇到下面这些情况，这个补丁就是针对它们的：
 
-  ```text
-  HTTP 200
-  Content-Length: 20089
-  实际 body: 0 字节
-  ```
+- ComfyUI 刚启动时一切正常，网页秒开；
+- 运行大约两小时后，网页开始难以访问，最后要多次访问偶尔才能打开甚至打不开；
+- 手机快速连续预览资产后，整个网页服务可能突然无响应；
+- 关掉终端里返回 `200` 但页面就是不出来。
 
-- 此时 `/system_stats` 仍然正常，但 `/`、`/index.html` 出不来；
-- 严重时主线程卡在 `socket.close()` / `closesocket()`，整个服务无响应；
-- 手机上的视频加载需要等一会儿，但页面本身还能继续打开。
+这些现象不是 ComfyUI 节点、显卡或模型的问题，而是 Windows 上 asyncio Proactor / aiohttp 的几个底层问题。
 
 ---
 
 ## 原因
 
-### 现象一：长时间运行后越来越慢
+### 问题一：self-pipe 长时间空闲后失效
 
-原因：Windows 上 asyncio 的 self-pipe 是一对 `127.0.0.1` TCP 连接。长时间空闲后，Proactor 的读 future 会以：
+Windows 上 asyncio 的 self-pipe 实际是一对 `127.0.0.1` TCP 连接。
+
+事件循环靠它接收其他线程的唤醒，例如：
+
+- Ctrl+C；
+- 后台线程回调；
+- 线程池完成通知。
+
+这台机器上，self-pipe 在约 **2 小时没有数据**后，Proactor 的读操作会以：
 
 ```text
 WinError 121（信号灯超时时间已到）
 ```
 
-结束。原版 asyncio 不会重新发起读取，self-pipe 读循环永久停止。
+结束。原版 asyncio 在失败后只记录异常，**不会重新发起读取**，于是读循环永久停止。
 
-主循环还在，API 也还能响应，但线程池完成、Ctrl+C 等唤醒只能等心跳；静态文件一个接一个等，首页就累积到几十秒。
+结果就是：
 
-对应修复：
+- 主循环还在跑；
+- API 还能响应；
+- 但线程池完成、Ctrl+C 等无法响应；
 
-- 心跳定时向 self-pipe 写 1 字节，防止空闲；
-- 读循环失败后 re-arm；
-- re-arm 连续失败后 rebuild。
+### 问题二：极速资产后 sendfile 只发头不发 body
 
-### 现象二：手机极速浏览资产后 sendfile 卡 body
+手机在极短时间内连续预览大量资产时，aiohttp 的 Windows 原生 sendfile 路径可能进入：
 
-原因：aiohttp 的 `FileResponse` 在 Windows Proactor 下默认走 native sendfile。手机快速取消/中断大量资产请求后，native sendfile 状态可能残留，之后静态文件只发响应头，不发 body。
+```text
+HTTP 200
+Content-Length: 20089
+实际 body: 0 字节
+```
 
-对应修复：
+此时 `/system_stats` 仍然正常，主线程也还在 `_poll`，所以不是 self-pipe，也不是主线程 `closesocket`。
 
-- 默认设置 `AIOHTTP_NOSENDFILE=1`，让静态文件走 read/write 回退；
-- 在 self-pipe 保活正常的情况下，回退路径实测也是毫秒级；
-- 如果需要原生 sendfile，设置 `COMFY_WIN_NOSENDFILE=0`。
+### 问题三：sendfile 中断会连带让 `closesocket` 卡住
 
-### 现象三：reset 连接 close 卡住
+手机快速浏览资产会建立大量连接，然后很快取消或关闭。  
+如果此时正在走 native sendfile，Proactor 的 sendfile 状态可能残留，随后：
 
-原因：手机 RST 连接后，Proactor 清理会调用 `socket.close()` / `closesocket()`。在某些 Windows native sendfile 残留状态下，这个 close 会长时间不返回，卡住主线程。
+```text
+_call_connection_lost()
+  -> socket.close()
+    -> closesocket()
+```
 
-对应修复（可选）：
+`closesocket` 可能长时间不返回，主线程被卡住。
 
-- `COMFY_WIN_DEFERRED_CLOSE=1` 时，只对 reset/`OSError` 连接延迟 close；
-- 普通正常关闭仍然同步；
-- 最多同时 16 个 close 线程，超过上限的 socket 直接 `detach`，不创建新线程。
+这不是独立的 close 问题，而是 native sendfile 被 abort 后的下游表现。  
+v2.3 默认：
+
+```bat
+set COMFY_WIN_NOSENDFILE=1
+```
+
+让 aiohttp 走 read/write 回退，同时避开 body 0 和 close 卡住。  
+回退路径在 self-pipe 保活下实测是毫秒级。
+
+如果要恢复原生 sendfile：
+
+```bat
+set COMFY_WIN_NOSENDFILE=0
+```
+
+代价是极速资产后仍可能再次出现 body 0 或 `closesocket` 卡住。AIOHTTP_NOSENDFILE 现在由补丁统一管理，不需要再手动设置它。
+
+---
+
+## 修复
+
+### 1. self-pipe 保活
+
+心跳每 60 秒向 self-pipe 写 1 字节：
+
+- self-pipe 不再长时间空闲；
+- 读操作持续刷新；
+- 2 小时 WinError 121 不再出现。
+
+日志中长时间运行应只有：
+
+```text
+health ... self_reading_future=pending
+```
+
+不再出现：
+
+```text
+read-loop-fail ... winerror=121
+```
+
+### 2. self-pipe 失败后的兜底
+
+如果保活仍然失败：
+
+1. 0.25 秒后用同一对 socket 重新发起读取（re-arm）；
+2. 连续失败 3 次后关闭并重建 self-pipe（rebuild）；
+3. 同时更新信号唤醒 fd。
+
+### 3. 默认禁用 sendfile
+
+补丁默认：
+
+```bat
+set COMFY_WIN_NOSENDFILE=1
+```
+
+并据此设置 aiohttp 的 `AIOHTTP_NOSENDFILE`。
+
+要恢复原生 sendfile：
+
+```bat
+set COMFY_WIN_NOSENDFILE=0
+```
+
+### 4. 不再保留 reset 延迟 close
+
+早期版本曾尝试对 RST 连接延迟 close，但后续确认：
+
+- close 卡住主要是 native sendfile 被 abort 后的下游表现；
+- 默认禁用 sendfile 后，极速资产不再产生该问题；
+- 延迟 close 没有解决 sendfile 本身，反而增加线程和 detached socket 的复杂度。
+
+因此 v2.3 删除了 reset 延迟 close 代码。  
+如果未来在 `NOSENDFILE=1` 下仍出现主线程卡在 `socket.close`，再重新评估。
 
 ---
 
 ## 默认行为
 
-```text
-self-pipe 保活/re-arm/rebuild    on
-heartbeat                        60 秒
-COMFY_WIN_NOSENDFILE             1（禁用 native sendfile）
-日志                              off
-reset 延迟 close                  off
-```
+默认只保留真正需要长期生效的修复：
 
-只有 `COMFY_WIN_NOSENDFILE=0` 才恢复原生 sendfile。
+- self-pipe 心跳保活；
+- self-pipe re-arm/rebuild；
+- 禁用 native sendfile（`COMFY_WIN_NOSENDFILE=1`）。
 
----
+默认关闭：
 
-## 安装（手动）
+- self-pipe 诊断日志（需要时 `COMFY_WIN_SAVELOG=1` 手动开启）；
+- 原生 sendfile（需要时 `COMFY_WIN_NOSENDFILE=0` 手动开启）。
 
-这个仓库**没有安装脚本**，因为不同 ComfyUI 安装方式的 Python 环境不同。
+日志默认不写文件，但 self-pipe 保活和 re-arm/rebuild 仍然生效。  
+`COMFY_WIN_SAVELOG=0` 是默认状态，不需要在启动脚本里写。
 
-### 1. 找到真正启动 ComfyUI 的 Python
+心跳默认 **60 秒**，可通过 `COMFY_WIN_HEARTBEAT_INTERVAL` 调整，范围 **1～3600 秒**。  
+如果设得很大，self-pipe 失效后的兜底唤醒也会变慢；一般 60 秒足够保活。
 
-用**启动 ComfyUI 的那个 Python**运行：
+### 可选环境变量
 
-```bat
-python.exe -c "import site; print(site.getsitepackages())"
-```
-
-把 `sitecustomize.py` 放进第一个可写的 `site-packages`。
-
-常见位置：
-
-**Windows 便携版**
-
-```text
-ComfyUI_windows_portable\python_embeded\Lib\site-packages\sitecustomize.py
-```
-
-**仓库 / venv / Desktop**
-
-```text
-<ComfyUI 目录>\.venv\Lib\site-packages\sitecustomize.py
-```
-
-ComfyUI Desktop 可能使用 `.venv`、`standalone-env` 或其他打包环境。  
-**只放在一个没有 torch / aiohttp 的基础环境里不会生效，也不会让 ComfyUI 能运行**；要确认那个 Python 真的能启动 `ComfyUI\main.py`。
-
-### 2. 不要覆盖已有的 `sitecustomize.py`
-
-如果目标目录里已经有 `sitecustomize.py`：
-
-- 先备份；
-- 把本补丁的代码合并进去；
-- 直接覆盖可能影响其他 Python 程序。
-
-### 3. 重启 ComfyUI
-
-启动横幅应出现：
-
-```text
-[ComfyUI-WinFix] COMFY-WINFIX v2.2 ACTIVE | heartbeat=60s | nosendfile=on | selfpipe-log=off | selfpipe-keepalive=on | selfpipe-rearm=on | deferred-close=off
-```
-
-看不到横幅说明没有加载：
-
-- 放错 `site-packages`；
-- 启动时用了 `-S`；
-- 文件有语法错误；
-- 被别的 `sitecustomize.py` 覆盖。
+| 变量                           | 默认 | 说明                                   |
+| ------------------------------ | ---- | -------------------------------------- |
+| `COMFY_WIN_HEARTBEAT`          | `1`  | `0` = 关闭心跳和 self-pipe 保活        |
+| `COMFY_WIN_HEARTBEAT_INTERVAL` | `60` | 心跳/保活秒数，1～3600                 |
+| `COMFY_WIN_NOSENDFILE`         | `1`  | `1` = 禁用 native sendfile；`0` = 启用 |
+| `COMFY_WIN_SAVELOG`            | `0`  | `1` = 开启 self-pipe 诊断日志          |
+| `COMFY_WIN_SAVELOG_PATH`       | 自动 | 覆盖日志路径                           |
+| `COMFY_WIN_QUIET`              | `0`  | `1` = 不打印启动横幅                   |
 
 ---
 
-## 验证
+## 原理简述
 
-```powershell
-curl.exe --noproxy "*" -o NUL -w "HTTP %{http_code} bytes=%{size_download} time %{time_total}s\n" http://127.0.0.1:8870/
-```
-
-正常应是：
+### self-pipe
 
 ```text
-HTTP 200 bytes=20089
+其他线程 / Ctrl+C / 线程池完成
+  -> 写 self-pipe
+    -> 事件循环醒来
+      -> 执行回调
 ```
 
-不是：
+self-pipe 坏掉后，网络 I/O 还能处理，但“线程唤醒”失效。
+
+### closesocket
 
 ```text
-HTTP 200 bytes=0
+手机 RST
+  -> Proactor 通知连接丢失
+    -> socket.close()
+      -> closesocket()
 ```
+
+`closesocket` 卡住时，主线程无法继续 `_poll`，所有请求都会停。
+
+### 与 sendfile 的关系
+
+这台机器上，`closesocket` 卡住不是独立问题，而是 native sendfile 被 abort 后的下游表现。  
+默认 `COMFY_WIN_NOSENDFILE=1` 后不再产生这种 sendfile 残留，因此 v2.3 删除了 reset 延迟 close 代码。
+
+self-pipe 则是另一条独立路径：它是唤醒通道，不会因为禁用 sendfile 而自动修好。
 
 ---
 
-## 可选环境变量
+## 诊断日志
 
-| 变量 | 默认 | 说明 |
-| --- | --- | --- |
-| `COMFY_WIN_HEARTBEAT` | `1` | `0` = 关闭心跳和 self-pipe 保活 |
-| `COMFY_WIN_HEARTBEAT_INTERVAL` | `60` | 心跳/保活秒数，1～3600 |
-| `COMFY_WIN_NOSENDFILE` | `1` | `1` = 禁用 native sendfile；`0` = 启用 |
-| `COMFY_WIN_DEFERRED_CLOSE` | `0` | `1` = 启用 reset 连接的延迟 close |
-| `COMFY_WIN_MAX_CLOSE_THREADS` | `16` | 延迟 close 最大并发线程数，1～256 |
-| `COMFY_WIN_SAVELOG` | `0` | `1` = 写 self-pipe 诊断日志 |
-| `COMFY_WIN_SAVELOG_PATH` | 自动 | 覆盖日志路径 |
-| `COMFY_WIN_QUIET` | `0` | `1` = 不打印启动横幅 |
-
-手机极速浏览资产较多时，建议保留：
-
-```bat
-set COMFY_WIN_NOSENDFILE=1
-set COMFY_WIN_DEFERRED_CLOSE=1
-```
-
-需要排查时再加：
+默认关闭。需要时在启动脚本里手动开启：
 
 ```bat
 set COMFY_WIN_SAVELOG=1
 ```
 
-日志默认在：
+日志写入：
 
 ```text
 ComfyUI\user\winfix_selfpipe.log
 ```
 
----
-
-## 日志里看什么
-
-```text
-init
-make
-write-ok-first
-health ... self_reading_future=pending
-```
-
-正常长跑应只有 `health ... pending`。
-
-异常：
-
-```text
-read-loop-fail
-read-loop-rearm
-self-pipe-rebuild
-health-bad
-close-abandoned
-```
-
-`read-loop-fail` 是 self-pipe 读循环失败；`close-abandoned` 是 reset close 线程达到上限后主动 detach。
+可用 `COMFY_WIN_SAVELOG_PATH` 改路径。  
+日志关闭不影响 self-pipe 保活/re-arm/rebuild。
 
 ---
 
-## 注意
+## 兼容性
 
-- 这是 Windows 专用补丁；
-- 需要 CPython 3.12/3.13；
-- ComfyUI 更新、Desktop 重建 `.venv` 后，文件可能被删除，需要重新放入；
-- native sendfile 性能更好，但在手机极速资产场景下可能卡 body；默认禁用它换稳定；
-- 本补丁不修改 ComfyUI 源码，只通过 `sitecustomize.py` 生效；
-- 卸载：停止 ComfyUI，删除 `site-packages\sitecustomize.py`，重启。
+- Windows 11；
+- ComfyUI 便携版，Python 3.13；
+- 只对 `...\ComfyUI\main.py` 启动的进程生效；
+- 不修改 ComfyUI 源码，只通过 `sitecustomize.py` 生效。
 
----
-
-## English summary
-
-A single-file Windows workaround for ComfyUI that:
-
-- keeps the asyncio Proactor self-pipe alive;
-- re-arms/rebuilds it if it fails;
-- disables the fragile native sendfile path by default (`COMFY_WIN_NOSENDFILE=1`);
-- optionally defers close of reset sockets (`COMFY_WIN_DEFERRED_CLOSE=1`).
-
-Copy `sitecustomize.py` into the `site-packages` directory of the Python environment that actually launches `ComfyUI\main.py`, restart ComfyUI, and look for the `[ComfyUI-WinFix]` banner.
-
-Do not overwrite an existing `sitecustomize.py`; back it up and merge.
-
-Tested on Windows 11, CPython 3.12/3.13, ComfyUI portable and Desktop `.venv`.
-
-This is a workaround, not an upstream fix.
