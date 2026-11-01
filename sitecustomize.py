@@ -4,7 +4,7 @@ Installed by ComfyUI-WinFix into ``python_embeded\\Lib\\site-packages``.
 It is loaded automatically by ``sitecustomize`` even when ComfyUI is started
 with ``python -s ...``; no ComfyUI source file is modified.
 
-What it does (v2.2, Proactor only):
+What it does (v2.3, Proactor only):
 
   1. Adds a heartbeat timer (default 60 seconds).  Every heartbeat also writes
      one byte through the event loop self-pipe.  That keeps the loopback
@@ -15,24 +15,18 @@ What it does (v2.2, Proactor only):
      socketpair.
   3. Optional log (default off): init/make/close, first write, write failures,
      read-loop failures/re-arm/rebuild, and a 60 second health line.
-  4. Optional reset-socket deferred close (default off): a phone that opens
-     many asset connections and aborts them can make ``closesocket`` block.
-     When enabled, only reset transports are moved to a daemon thread; normal
-     closes stay synchronous.
-  5. Sets ``AIOHTTP_NOSENDFILE`` from ``COMFY_WIN_NOSENDFILE`` (default on).
+  4. Sets ``AIOHTTP_NOSENDFILE`` from ``COMFY_WIN_NOSENDFILE`` (default on).
      This avoids the Windows Proactor native-sendfile path that can wedge after
      rapid phone asset browsing.  Set ``COMFY_WIN_NOSENDFILE=0`` to use native
      sendfile.
 
 The banner:
-    [ComfyUI-WinFix] COMFY-WINFIX v2.2 ACTIVE | heartbeat=...
+    [ComfyUI-WinFix] COMFY-WINFIX v2.3 ACTIVE | heartbeat=...
 
 Environment variables:
     COMFY_WIN_HEARTBEAT=0             disable heartbeat + self-pipe keepalive
     COMFY_WIN_HEARTBEAT_INTERVAL=60   heartbeat/keepalive seconds (1..3600)
     COMFY_WIN_NOSENDFILE=0            use native aiohttp sendfile
-    COMFY_WIN_DEFERRED_CLOSE=1        enable reset-socket deferred close
-    COMFY_WIN_MAX_CLOSE_THREADS=16    max concurrent deferred close threads
     COMFY_WIN_SAVELOG=1               enable the self-pipe log
     COMFY_WIN_SAVELOG_PATH=...        override the self-pipe log path
     COMFY_WIN_QUIET=1                 do not print the startup banner
@@ -41,119 +35,8 @@ Environment variables:
 import os
 import sys
 
-PATCH_TAG = "COMFY-WINFIX v2.2"
+PATCH_TAG = "COMFY-WINFIX v2.3"
 sys._comfy_winfix_loaded = True
-
-_CLOSE_ACTIVE = 0
-_CLOSE_LOCK = None
-
-
-class _DeferredCloseSocket:
-    """Proxy whose close() hands a reset socket to a bounded daemon thread."""
-
-    __slots__ = ("_sock",)
-
-    def __init__(self, sock):
-        self._sock = sock
-
-    def shutdown(self, how):
-        # The original transport calls shutdown() before close(); do both in
-        # the thread so a kernel stall cannot block the event loop thread.
-        return None
-
-    def close(self):
-        global _CLOSE_ACTIVE, _CLOSE_LOCK
-
-        sock = self._sock
-        self._sock = None
-        if sock is None:
-            return
-
-        import threading
-
-        if _CLOSE_LOCK is None:
-            _CLOSE_LOCK = threading.Lock()
-        try:
-            max_threads = int(
-                os.environ.get("COMFY_WIN_MAX_CLOSE_THREADS", "16")
-            )
-        except (TypeError, ValueError):
-            max_threads = 16
-        max_threads = max(1, min(256, max_threads))
-
-        with _CLOSE_LOCK:
-            if _CLOSE_ACTIVE >= max_threads:
-                abandon = True
-            else:
-                abandon = False
-                _CLOSE_ACTIVE += 1
-
-        if abandon:
-            # Do not create an unbounded number of stuck threads.  Detaching
-            # leaves the kernel socket until process exit, but keeps the loop
-            # and the thread count bounded.
-            try:
-                sock.detach()
-            except Exception:
-                pass
-            _selfpipe_log(
-                "close-abandoned",
-                details=(
-                    f"active={_CLOSE_ACTIVE} max={max_threads}"
-                ),
-            )
-            return
-
-        def _close():
-            global _CLOSE_ACTIVE
-
-            try:
-                try:
-                    import socket
-                    import struct
-
-                    sock.setsockopt(
-                        socket.SOL_SOCKET,
-                        socket.SO_LINGER,
-                        struct.pack("hh", 1, 0),
-                    )
-                except Exception:
-                    pass
-                try:
-                    import socket
-
-                    sock.shutdown(socket.SHUT_RDWR)
-                except Exception:
-                    pass
-                try:
-                    sock.close()
-                except Exception:
-                    pass
-            finally:
-                with _CLOSE_LOCK:
-                    _CLOSE_ACTIVE -= 1
-
-        try:
-            threading.Thread(
-                target=_close,
-                daemon=True,
-                name="comfy-winfix-close",
-            ).start()
-        except Exception:
-            with _CLOSE_LOCK:
-                _CLOSE_ACTIVE -= 1
-            # Never close synchronously on the event loop; leak the descriptor
-            # instead of risking a freeze.
-            try:
-                sock.detach()
-            except Exception:
-                pass
-
-    def __getattr__(self, name):
-        sock = self._sock
-        if sock is None:
-            raise AttributeError(name)
-        return getattr(sock, name)
 
 
 def _is_comfyui_main() -> bool:
@@ -328,33 +211,6 @@ def _selfpipe_log_health(loop) -> None:
             f"self_reading_future={future_state}"
         ),
     )
-
-
-def _install_deferred_close_guard() -> bool:
-    """Defer socket.close() only for reset transports, never for normal closes."""
-    try:
-        from asyncio import proactor_events
-    except Exception:
-        return False
-
-    cls = getattr(proactor_events, "_ProactorBasePipeTransport", None)
-    if cls is None:
-        return False
-
-    original = cls._call_connection_lost
-    if getattr(original, "_comfy_winfix_deferred", False):
-        return True
-
-    def _call_connection_lost(self, exc, _original=original):
-        if isinstance(exc, OSError):
-            sock = getattr(self, "_sock", None)
-            if sock is not None and not isinstance(sock, _DeferredCloseSocket):
-                self._sock = _DeferredCloseSocket(sock)
-        return _original(self, exc)
-
-    _call_connection_lost._comfy_winfix_deferred = True
-    cls._call_connection_lost = _call_connection_lost
-    return True
 
 
 def _install_self_pipe_guard() -> bool:
@@ -629,10 +485,6 @@ def apply_winfix() -> bool:
 
     selfpipe_ok = _install_self_pipe_guard()
 
-    deferred_ok = False
-    if os.environ.get("COMFY_WIN_DEFERRED_CLOSE", "0") == "1":
-        deferred_ok = _install_deferred_close_guard()
-
     heartbeat_requested = os.environ.get("COMFY_WIN_HEARTBEAT", "1") != "0"
     interval = _env_float("COMFY_WIN_HEARTBEAT_INTERVAL", 60.0, 1.0, 3600.0)
     heartbeat_ok = False
@@ -649,8 +501,7 @@ def apply_winfix() -> bool:
             f"nosendfile={'on' if nosendfile_ok else 'off'} | "
             f"selfpipe-log={'on' if _SELFPIPE_LOG_ENABLED else 'off'} | "
             f"selfpipe-keepalive={'on' if heartbeat_ok else 'off'} | "
-            f"selfpipe-rearm={'on' if selfpipe_ok else 'off'} | "
-            f"deferred-close={'on' if deferred_ok else 'off'}",
+            f"selfpipe-rearm={'on' if selfpipe_ok else 'off'}",
             flush=True,
         )
 
