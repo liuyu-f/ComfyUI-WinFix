@@ -5,8 +5,23 @@
 
 ## 安装
 
-- Comfy Desktop端：将文件`sitecustomize.py`放入`(comfy实例)\ComfyUI\.venv\Lib\site-packages`文件夹。
-- ComfyUI便携版：将文件`sitecustomize.py`放入`ComfyUI_windows_portable\python_embeded\Lib\site-packages`文件夹。
+需要同时放入两个文件：
+
+```text
+comfy_win_fix.py
+zzz_comfy_win_fix.pth
+```
+
+- Comfy Desktop端：放入 `(comfy实例)\ComfyUI\.venv\Lib\site-packages`
+- ComfyUI便携版：放入 `ComfyUI_windows_portable\python_embeded\Lib\site-packages`
+
+`zzz_comfy_win_fix.pth` 只有一行，且不能带 BOM：
+
+```text
+import comfy_win_fix
+```
+
+如果之前装过旧版 `sitecustomize.py`，先删除旧文件，避免同一补丁被加载两次。
 
 ## 现象
 
@@ -73,7 +88,7 @@ _call_connection_lost()
 `closesocket` 可能长时间不返回，主线程被卡住。
 
 这不是独立的 close 问题，而是 native sendfile 被 abort 后的下游表现。  
-v2.3 默认：
+v2.4 默认：
 
 ```bat
 set COMFY_WIN_NOSENDFILE=1
@@ -146,7 +161,7 @@ set COMFY_WIN_NOSENDFILE=0
 - 默认禁用 sendfile 后，极速资产不再产生该问题；
 - 延迟 close 没有解决 sendfile 本身，反而增加线程和 detached socket 的复杂度。
 
-因此 v2.3 删除了 reset 延迟 close 代码。  
+因此 v2.4 删除了 reset 延迟 close 代码。  
 如果未来在 `NOSENDFILE=1` 下仍出现主线程卡在 `socket.close`，再重新评估。
 
 ---
@@ -210,7 +225,7 @@ self-pipe 坏掉后，网络 I/O 还能处理，但“线程唤醒”失效。
 ### 与 sendfile 的关系
 
 这台机器上，`closesocket` 卡住不是独立问题，而是 native sendfile 被 abort 后的下游表现。  
-默认 `COMFY_WIN_NOSENDFILE=1` 后不再产生这种 sendfile 残留，因此 v2.3 删除了 reset 延迟 close 代码。
+默认 `COMFY_WIN_NOSENDFILE=1` 后不再产生这种 sendfile 残留，因此 v2.4 删除了 reset 延迟 close 代码。
 
 self-pipe 则是另一条独立路径：它是唤醒通道，不会因为禁用 sendfile 而自动修好。
 
@@ -240,5 +255,4 @@ ComfyUI\user\winfix_selfpipe.log
 - Windows 11；
 - ComfyUI 便携版，Python 3.13；
 - 只对 `...\ComfyUI\main.py` 启动的进程生效；
-- 不修改 ComfyUI 源码，只通过 `sitecustomize.py` 生效。
-
+- 不修改 ComfyUI 源码，只通过 `zzz_comfy_win_fix.pth` 加载 `comfy_win_fix.py` 生效。
