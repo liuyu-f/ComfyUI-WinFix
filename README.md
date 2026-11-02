@@ -21,8 +21,6 @@ zzz_comfy_win_fix.pth
 import comfy_win_fix
 ```
 
-如果之前装过旧版 `sitecustomize.py`，先删除旧文件，避免同一补丁被加载两次。
-
 ## 现象
 
 如果你遇到下面这些情况，这个补丁就是针对它们的：
